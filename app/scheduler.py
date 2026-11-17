@@ -6,6 +6,15 @@
 - 慢清理只占住自己的名额，不阻塞另一名额上的独立步骤/构建。
 - 每个构建一个 asyncio 任务，轮询 DAG 状态推进；每个运行中的步骤一个子任务，
   通过 per-build cancel event 实现整次取消的即时响应。
+
+取消与终态的竞态约定：
+- cancel event 在构建任务**创建之前**就登记好，杜绝"提交后立即取消时事件还不存在"
+  的空窗；取消受理以数据库内带终态守卫的单条 UPDATE 为准（见
+  ``Database.request_cancel_if_active``），受理与终态写入由 SQLite 写锁线性化。
+- 一旦受理：未启动步骤一律不再启动（主循环与名额排队后双重检查），运行中的
+  命令及其后代进程组清空后才确认步骤/构建终态并释放名额。
+- 终态先写入则取消 UPDATE 命中 0 行，明确忽略，原记录（含 cancel_requested）
+  保持不变；构建终态同样只允许从非终态写入一次（``finish_build_if_active``）。
 """
 from __future__ import annotations
 
@@ -18,7 +27,7 @@ from typing import Any, Optional
 
 from . import config, proc
 from .db import Database
-from .models import BUILD_TERMINAL, BuildCreate, validate_dag
+from .models import BuildCreate, validate_dag
 
 _STEP_FAIL_STATES = {"failed", "skipped", "cancelled", "interrupted"}
 
@@ -52,23 +61,35 @@ class Scheduler:
                 step.timeout_seconds,
                 str(log_path),
             )
+        # 事件先于构建任务登记：提交响应返回后立即取消也不会遇到 event 缺失。
+        event = asyncio.Event()
+        self._build_events[build_id] = event
         task = asyncio.create_task(self._run_build(build_id), name=f"build-{build_id}")
         self._build_tasks[build_id] = task
         task.add_done_callback(self._log_task_exception)
         return build_id
 
-    async def cancel(self, build_id: int) -> tuple[Optional[dict[str, Any]], str]:
-        """返回 (构建行或 None, 说明)。重复取消幂等，不改变已定终态。"""
+    async def cancel(self, build_id: int) -> tuple[Optional[dict[str, Any]], str, bool]:
+        """处理取消请求，返回 (构建行或 None, 说明, 是否受理)。
+
+        受理判定完全交给带终态守卫的原子 UPDATE：只有取消先于构建终态落库
+        才会置位并返回 True；终态先写入则命中 0 行，明确忽略且不改任何字段。
+        重复取消（已受理但构建尚未进入终态）幂等：仍回复受理、事件重复 set。
+        """
         row = await self.db.get_build(build_id)
         if row is None:
-            return None, "构建不存在"
-        if row["status"] in BUILD_TERMINAL:
-            return dict(row), f"构建已处于终态 {row['status']}，取消请求忽略"
-        await self.db.request_cancel(build_id)
+            return None, "构建不存在", False
+        accepted = await self.db.request_cancel_if_active(build_id)
+        if not accepted:
+            # 守卫未命中：构建已是终态。重新读取保证返回内容与落库记录一致。
+            fresh = await self.db.get_build(build_id)
+            return dict(fresh), f"构建已处于终态 {fresh['status']}，取消请求忽略", False
         event = self._build_events.get(build_id)
         if event is not None:
             event.set()
-        return dict(row), "取消请求已受理，运行中的步骤将终止整个进程组"
+        # event 理论上不会缺失（submit 已预先登记），缺失时 DB 标志仍在，
+        # 构建任务启动后会立即读取该标志，取消不会丢。
+        return dict(row), "取消请求已受理，运行中的步骤将终止整个进程组", True
 
     # ------------------------------------------------------------- 重启恢复
 
@@ -147,14 +168,19 @@ class Scheduler:
     # ------------------------------------------------------------- 构建主循环
 
     async def _run_build(self, build_id: int) -> None:
-        event = asyncio.Event()
-        self._build_events[build_id] = event
+        # 事件由 submit 预先登记；这里只取引用，不再新建，避免取消早于任务首跑时丢失
+        event = self._build_events[build_id]
         # (步骤 uid, 步骤任务) 成对保存，避免用任务名反解 uid
         step_tasks: list[tuple[str, asyncio.Task[str]]] = []
         try:
             await self.db.set_build_status(
                 build_id, "running", _now(), started=True
             )
+            # 权威来源是落库标志：任务真正开始调度前取消可能已经受理
+            # （此时 event 也已被 set，双保险，二者任一命中即视为取消）。
+            build_row = await self.db.get_build(build_id)
+            if build_row is not None and build_row["cancel_requested"]:
+                event.set()
             rows = await self.db.get_steps(build_id)
             statuses = {row["step_uid"]: row["status"] for row in rows}
             by_id = {row["step_uid"]: row for row in rows}
@@ -190,6 +216,10 @@ class Scheduler:
                 for uid, row in by_id.items():
                     if statuses[uid] != "pending":
                         continue
+                    # 启动前再次确认取消：上一轮 await（落库等）期间取消可能刚受理，
+                    # 已受理的构建绝不能再启动任何新步骤
+                    if event.is_set():
+                        break
                     deps = json.loads(row["depends_on"])
                     dep_st = [statuses[d] for d in deps]
                     if any(s in _STEP_FAIL_STATES for s in dep_st):
@@ -239,9 +269,9 @@ class Scheduler:
             else:
                 final = "succeeded"
                 detail = "全部步骤成功"
-            await self.db.set_build_status(
-                build_id, final, _now(), detail=detail, finished=True
-            )
+            # 终态只允许写入一次：若取消受理与收尾交错导致守卫未命中，
+            # 保持先前已落库的终态，绝不覆盖原记录
+            await self.db.finish_build_if_active(build_id, final, _now(), detail)
         finally:
             self._build_events.pop(build_id, None)
             self._build_tasks.pop(build_id, None)
@@ -251,9 +281,15 @@ class Scheduler:
     async def _run_step_with_slot(self, build_id: int, row: Any) -> str:
         """名额覆盖"启动 -> 运行 -> 进程组完全清空 -> 终态落库"全过程。"""
         async with self._slots:
-            # 排队期间构建可能已被取消：取消优先，不得再启动新进程
+            # 排队期间构建可能已被取消：取消优先，不得再启动新进程。
+            # event 与落库标志双检查，任一命中即放弃启动（标志是权威来源，
+            # 防止极端时序下内存事件尚未登记/已被清理）。
             event = self._build_events.get(build_id)
-            if event is not None and event.is_set():
+            build_row = await self.db.get_build(build_id)
+            cancelled = (event is not None and event.is_set()) or bool(
+                build_row is not None and build_row["cancel_requested"]
+            )
+            if cancelled:
                 await self.db.set_step_status(
                     row["id"],
                     "cancelled",

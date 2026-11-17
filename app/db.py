@@ -153,10 +153,45 @@ class Database:
         params.append(build_id)
         await self.execute(f"UPDATE builds SET {', '.join(sets)} WHERE id=?", tuple(params))
 
-    async def request_cancel(self, build_id: int) -> None:
-        await self.execute(
-            "UPDATE builds SET cancel_requested=1 WHERE id=?", (build_id,)
+    async def request_cancel_if_active(self, build_id: int) -> bool:
+        """原子地受理取消：仅当构建仍处于非终态时置位 cancel_requested。
+
+        终态判定与置位在同一条 UPDATE 内完成，借助 SQLite 写锁线性化
+        "取消受理" 与 "构建终态写入" 两个动作：
+        - 返回 True 表示取消先于终态生效，调用方才能回复"已受理"；
+        - 返回 False 表示终态已先写入，取消被忽略，记录一个字节都不改。
+        """
+        assert self._conn is not None
+        cur = await self._conn.execute(
+            """
+            UPDATE builds
+               SET cancel_requested=1
+             WHERE id=?
+               AND status NOT IN ('succeeded','failed','cancelled','interrupted')
+            """,
+            (build_id,),
         )
+        return cur.rowcount == 1
+
+    async def finish_build_if_active(
+        self, build_id: int, status: str, now: str, detail: str
+    ) -> bool:
+        """构建终态落库的唯一入口：带终态守卫，只允许从非终态写入一次。
+
+        已处于终态的构建不会被任何收尾交错改写（保持原记录）。
+        返回 False 说明终态此前已写入，本次收尾放弃落笔。
+        """
+        assert self._conn is not None
+        cur = await self._conn.execute(
+            """
+            UPDATE builds
+               SET status=?, detail=?, finished_at=?
+             WHERE id=?
+               AND status NOT IN ('succeeded','failed','cancelled','interrupted')
+            """,
+            (status, detail, now, build_id),
+        )
+        return cur.rowcount == 1
 
     async def set_step_process(
         self, step_pk: int, pid: int, pgid: int, starttime: float, now: str

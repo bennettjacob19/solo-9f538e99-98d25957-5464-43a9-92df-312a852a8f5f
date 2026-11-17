@@ -12,7 +12,12 @@ FastAPI + SQLite 实现的 DAG 构建流水线：接收至多 12 步的 JSON DAG
 | 全局最多两步并行 | 单 worker 内 `asyncio.Semaphore(2)`，名额覆盖步骤全生命周期 |
 | 依赖全成功才启动 | 调度器按 DAG 推进，依赖未全部 `succeeded` 不启动 |
 | 失败使后代跳过，独立分支继续 | 上游出现失败/取消/中断即置后代 `skipped`；无依赖关系的分支不受影响 |
-| 整次取消停止所有未完成步骤 | `POST /builds/{id}/cancel`，per-build 事件即时通知；未启动步骤不再启动 |
+| 整次取消停止所有未完成步骤 | `POST /builds/{id}/cancel`，per-build 事件即时通知；事件在构建任务创建前预先登记，提交后立即取消也不会丢 |
+| 取消受理与构建终态线性化 | 受理只走带终态守卫的单条 SQL（`request_cancel_if_active`）：取消先于终态才置位并回复受理；终态先写入则命中 0 行、明确忽略，`status/cancel_requested/finished_at` 原记录不变 |
+| 受理后未启动/依赖步骤不再启动 | 主循环启动前与名额排队获得后双重检查取消标志，任一命中即置 `cancelled`，绝不 spawn 新进程 |
+| 取消确认前必须清空进程组并释放名额 | 运行中命令及其后代经 SIGTERM→SIGKILL 整组排空，`/proc` 确认无成员后才写步骤/构建终态，信号量名额同步释放 |
+| 构建终态只写一次 | `finish_build_if_active` 带终态守卫，取消与收尾交错时后到的终态写入被拒绝，杜绝把已成功记录改成已取消 |
+| 重启不补跑已取消构建 | 恢复只清残留并标 `interrupted`/保留已落 `cancelled`，不恢复调度；任何未启动步骤都不会再执行 |
 | 超时/取消终止对应进程组 | 每步 `start_new_session=True` 独立进程组，`killpg(PGID, SIGTERM→SIGKILL)` |
 | 主命令退出后慢子进程清理并判失败 | 退出后扫描 `/proc` 检查组内残留，有残留即清理且步骤判 `failed` |
 | 进程组清空前不释放名额/不确认终态 | 信号量在清理完成、终态落库后才释放；期间状态可见为 `cleaning_up` |
@@ -107,6 +112,9 @@ curl -s -X POST localhost:8000/builds/1/cancel
 - `tests/test_integration.py`：以真实 uvicorn 子进程端到端验证成功、失败跳过、
   慢子进程清理判失败、超时、并行上限 2、整次取消、重复取消幂等、慢清理不占
   另一名额、重启恢复（含不误杀后来构建）、错误请求与文档接口。
+- `tests/test_cancel_race.py`：取消/终态竞态专项 —— 提交后立即取消不丢、
+  终态先写入时取消被忽略且记录不改、DB 守卫两种交错顺序的确定性验证、
+  取消清空顽固后代后才释放名额、重启后不补跑已取消构建的步骤。
 
 ## 配置（环境变量）
 

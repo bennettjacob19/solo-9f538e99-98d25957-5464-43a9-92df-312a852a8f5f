@@ -105,13 +105,14 @@ async def get_build(build_id: int) -> BuildOut:
 
 @app.post("/builds/{build_id}/cancel", response_model=CancelOut)
 async def cancel_build(build_id: int) -> CancelOut:
-    row, message = await scheduler.cancel(build_id)
+    row, message, _accepted = await scheduler.cancel(build_id)
     if row is None:
         raise HTTPException(status_code=404, detail="构建不存在")
-    # 重新读取以拿到 cancel_requested 的真实落库值（终态上的重复取消不会置位）
+    # 重新读取以拿到 cancel_requested / status 的真实落库值：
+    # 终态先写入时取消被忽略，cancel_requested 不会被置位、记录保持原样
     fresh = await db.get_build(build_id)
     return CancelOut(
-        id=row["id"],
+        id=fresh["id"],
         status=fresh["status"],
         cancel_requested=bool(fresh["cancel_requested"]),
         detail=message,
